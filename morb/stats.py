@@ -6,7 +6,7 @@ import numpy as np
 
 import theano
 
-rng = RandomStreams.seed(100)
+rng = RandomStreams(seed=100)
 
 def gibbs_step(rbm, vmap, units_list, mean_field_for_stats=[], mean_field_for_gibbs=[]):
     # implements a single gibbs step, and makes sure mean field is only used where it should be.
@@ -172,6 +172,7 @@ def manipulate_vmap(vmap, f):
 
 def pt_stats(rbm, v0_vmap, visible_units, hidden_units, persistent_vmap, beta, k=1, m=1):
     """Returns stats for parallel tempering given a list of inverse temperatures beta.
+
     
     
     """
@@ -179,7 +180,7 @@ def pt_stats(rbm, v0_vmap, visible_units, hidden_units, persistent_vmap, beta, k
     # k is the number of sampling steps
     # persistent_vmap and v0_vmap should determine the data batch size and the number of chains
     # m is the number of chains that is used for model statistics
-    N_chains = persistent_vmap[rbm.v].shape[0]
+    N_chains = persistent_vmap[rbm.h].shape[0]
 
 
     # complete units lists
@@ -215,9 +216,6 @@ def pt_stats(rbm, v0_vmap, visible_units, hidden_units, persistent_vmap, beta, k
         v1_scaled_activation_vmap = rescale_activations(v1_activation_vmap, beta)
         
         v1_gibbs_vmap_preswap = rbm.sample_from_activation(v1_scaled_activation_vmap)
-        # stats contains the values that are used for parameter updating and
-        # should only be based on the first m chain(s) that have temperature 1.
-        v1_stats_vmap_preswap = manipulate_vmap(v1_gibbs_vmap_preswap, lambda x: x[:m, :])
 
         h1_in_vmap = v1_gibbs_vmap_preswap.copy()
 
@@ -225,44 +223,38 @@ def pt_stats(rbm, v0_vmap, visible_units, hidden_units, persistent_vmap, beta, k
 
         h1_scaled_activation_vmap = rescale_activations(h1_activation_vmap, beta)
         h1_gibbs_vmap_preswap = rbm.sample_from_activation(h1_scaled_activation_vmap)
-
-        # Select a candidate pair for replica exchange
-        rv_i = rng.random_integers((1,), low=0, high=N_chains-2) #the range is inclusive
-        rv_u = rng.uniform((1,))
         
-        chain_pair = manipulate_vmap(h1_scaled_activation_vmap, lambda x: x[rv_i:rv_i+2, :])
-        chain_pair_v = manipulate_vmap(v1_gibbs_vmap_preswap, lambda x: x[rv_i:rv_i+2, :])
-        left_chain = manipulate_vmap(h1_scaled_activation_vmap, lambda x: x[rv_i, :])
-        right_chain = manipulate_vmap(h1_scaled_activation_vmap, lambda x: x[rv_i+1, :])
+        # merge activations
+        samples = h1_gibbs_vmap_preswap
+        samples[rbm.v] = v1_gibbs_vmap_preswap[rbm.v]
+
+        # Select a candidate (from N_chains-1 possible pairs) pair for replica exchange
+        rv_i = rng.random_integers(low=0, high=N_chains-2) #the range is inclusive
+        rv_u = rng.uniform()
+        
+        
+        chain_pair = manipulate_vmap(samples, lambda x: x[rv_i:rv_i+2, :])
 
         # compute relevant energy scores
-        # Note that we could use eigher the energy or the free energy. Using
-        # the free energy will sample from p(v) instead of p(v, h) and is what
-        # we are interested in.
-        # Also note that we don't need to store the h values because the chain
-        # always starts from the visible units.
-        v_fe_pair = rbm.free_energy_unchanged_terms(units_list=hidden_units,
-                                                    vmap=chain_pair_v)
-        h_fe_pair = rbm.free_energy_affected_terms_from_activation(units_list=hidden_units,
-                                                    vmap=chain_pair)
-        fe_pair = dict((v, v_fe_pair[v] * beta[rv_i:rv_i+2] + h_fe_pair)
-                       for v, tensor in v_fe_pair.keys())
-        fe1, fe2 = fe_pair[rbm.v] # looses flexibility
-        b1, b2 = beta[rv_i], beta[rv_i+1]
-        r = T.exp((b1 - b2) * (fe1 - fe2))
-        if rv_u < r:
-            indices = T.arange(N_chains)
-            indices[rv_i] = rv_i + 1
-            indices[rv_i+1] = rv_i
-            v1_gibbs_vmap = manipulate_vmap(v1_gibbs_vmap_preswap,
-                                                 lambda x: x[indices, :])
-            h1_gibbs_vmap = manipulate_vmap(h1_gibbs_vmap_preswap,
-                                                 lambda x: x[indices, :])
-            v1_stats_vmap = manipulate_vmap(v1_stats_vmap_preswap,
-                                            lambda x: x[indices[:m], :])
+        e_pair = rbm.energy(chain_pair) # vector with two elements
         
+        b1, b2 = beta[rv_i][0], beta[rv_i+1][0]
         
+        r = T.exp((b1 - b2) * (e_pair[0] - e_pair[1]))
+        #if rv_u <= r: # swap the samples
+        if T.le(rv_u, r): # swap the samples
+            def swap(x):
+                return T.concatenate((x[:rv_i, :], x[rv_i+1:rv_i+2, :],
+                                   x[rv_i:rv_i+1, :], x[rv_i+2:, :]))
+            v1_gibbs_vmap = manipulate_vmap(v1_gibbs_vmap_preswap, swap)
+            h1_gibbs_vmap = manipulate_vmap(h1_gibbs_vmap_preswap, swap)
+        else:
+            v1_gibbs_vmap = v1_gibbs_vmap_preswap
+            h1_gibbs_vmap = h1_gibbs_vmap_preswap
+        
+        # only use the first m chains for stats
         h1_stats_vmap = manipulate_vmap(h1_gibbs_vmap, lambda x: x[:m, :] * rescale)
+        v1_stats_vmap = manipulate_vmap(v1_gibbs_vmap, lambda x: x[:m, :] * rescale)
         
         # get the v1 values in a fixed order
         v1_activation_values = [v1_activation_vmap[u] for u in visible_units]
@@ -291,6 +283,7 @@ def pt_stats(rbm, v0_vmap, visible_units, hidden_units, persistent_vmap, beta, k
     # we only need the final outcomes, not intermediary values
     exp_output_list = [out[-1] for out in exp_output_all_list]
             
+    # TODO: this messes things up when I use larger batches of data
     # reconstruct vmaps from the exp_output_list.
     n_input, n_latent = len(visible_units), len(hidden_units)
     vk_activation_vmap = dict(zip(visible_units, exp_output_list[0:1*n_input]))
