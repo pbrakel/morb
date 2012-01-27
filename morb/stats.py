@@ -170,18 +170,24 @@ def manipulate_vmap(vmap, f):
     # TODO: check with S
     return dict((v, f(tensor)) for v, tensor in vmap.items())
 
+def switch_vmap(condition, vmap1, vmap2):
+    return dict((v, T.switch(condition, vmap1[v], vmap2[v])) for v in vmap1.keys())
+
+
 def pt_stats(rbm, v0_vmap, visible_units, hidden_units, persistent_vmap, beta, k=1, m=1):
     """Returns stats for parallel tempering given a list of inverse temperatures beta.
 
     
     
     """
+    # TODO: use an additional shared variable in scan's output info to count
+    # the switch acceptances.
+
     # v0_vmap is the batch of train data
     # k is the number of sampling steps
     # persistent_vmap and v0_vmap should determine the data batch size and the number of chains
     # m is the number of chains that is used for model statistics
     N_chains = persistent_vmap[rbm.h].shape[0]
-
 
     # complete units lists
     visible_units = rbm.complete_units_list(visible_units)
@@ -203,7 +209,6 @@ def pt_stats(rbm, v0_vmap, visible_units, hidden_units, persistent_vmap, beta, k
     exp_input = [v0_vmap[u] for u in visible_units]
     exp_latent = [h0_stats_vmap[u] for u in hidden_units]
 
-    rescale = mb_size / n_chains
     
     def gibbs_hvh(*args):
         # generates a fixed order list to be processed by scan
@@ -241,20 +246,19 @@ def pt_stats(rbm, v0_vmap, visible_units, hidden_units, persistent_vmap, beta, k
         b1, b2 = beta[rv_i][0], beta[rv_i+1][0]
         
         r = T.exp((b1 - b2) * (e_pair[0] - e_pair[1]))
-        #if rv_u <= r: # swap the samples
-        if T.le(rv_u, r): # swap the samples
-            def swap(x):
-                return T.concatenate((x[:rv_i, :], x[rv_i+1:rv_i+2, :],
-                                   x[rv_i:rv_i+1, :], x[rv_i+2:, :]))
-            v1_gibbs_vmap = manipulate_vmap(v1_gibbs_vmap_preswap, swap)
-            h1_gibbs_vmap = manipulate_vmap(h1_gibbs_vmap_preswap, swap)
-        else:
-            v1_gibbs_vmap = v1_gibbs_vmap_preswap
-            h1_gibbs_vmap = h1_gibbs_vmap_preswap
+        comparison = T.le(rv_u, r)
+        accepted = T.cast(T.switch(comparison, rv_i, -1), dtype=theano.config.floatX)
+        def swap(x):
+            return T.concatenate((x[:rv_i, :], x[rv_i+1:rv_i+2, :],
+                               x[rv_i:rv_i+1, :], x[rv_i+2:, :]))
+        v1_gibbs_vmap_swap = manipulate_vmap(v1_gibbs_vmap_preswap, swap)
+        h1_gibbs_vmap_swap = manipulate_vmap(h1_gibbs_vmap_preswap, swap)
+        v1_gibbs_vmap = switch_vmap(comparison, v1_gibbs_vmap_swap, v1_gibbs_vmap_preswap)
+        h1_gibbs_vmap = switch_vmap(comparison, h1_gibbs_vmap_swap, h1_gibbs_vmap_preswap)
         
         # only use the first m chains for stats
-        h1_stats_vmap = manipulate_vmap(h1_gibbs_vmap, lambda x: x[:m, :] * rescale)
-        v1_stats_vmap = manipulate_vmap(v1_gibbs_vmap, lambda x: x[:m, :] * rescale)
+        h1_stats_vmap = manipulate_vmap(h1_gibbs_vmap, lambda x: x[:m, :])
+        v1_stats_vmap = manipulate_vmap(v1_gibbs_vmap, lambda x: x[:m, :])
         
         # get the v1 values in a fixed order
         v1_activation_values = [v1_activation_vmap[u] for u in visible_units]
@@ -267,7 +271,7 @@ def pt_stats(rbm, v0_vmap, visible_units, hidden_units, persistent_vmap, beta, k
         h1_stats_values = [h1_stats_vmap[u] for u in hidden_units]
         
         return v1_activation_values + v1_stats_values + v1_gibbs_values + \
-               h1_activation_values + h1_stats_values + h1_gibbs_values
+               h1_activation_values + h1_stats_values + h1_gibbs_values + [accepted]
     
     
     chain_start = [persistent_vmap[u] for u in hidden_units]
@@ -276,12 +280,15 @@ def pt_stats(rbm, v0_vmap, visible_units, hidden_units, persistent_vmap, beta, k
     # The 'outputs_info' keyword argument of scan configures how the function outputs are mapped to the inputs.
     # in this case, we want the h1_gibbs_vmap values to map onto the function arguments, so they become
     # h0_gibbs_vmap values in the next iteration. To this end, we construct outputs_info as follows:
-    outputs_info = [None] * (len(exp_input)*3) + [None] * (len(exp_latent)*2) + list(chain_start)
+    outputs_info = [None] * (len(exp_input)*3) + [None] * (len(exp_latent)*2) + list(chain_start) + [None]
+ 
     # 'None' indicates that this output is not used in the next iteration.
     
     exp_output_all_list, theano_updates = theano.scan(gibbs_hvh, outputs_info = outputs_info, n_steps = k)
     # we only need the final outcomes, not intermediary values
     exp_output_list = [out[-1] for out in exp_output_all_list]
+    accepted = exp_output_all_list[-1]
+    #accepted = exp_output_list[-1]
             
     # TODO: this messes things up when I use larger batches of data
     # reconstruct vmaps from the exp_output_list.
@@ -292,7 +299,6 @@ def pt_stats(rbm, v0_vmap, visible_units, hidden_units, persistent_vmap, beta, k
     hk_activation_vmap = dict(zip(hidden_units, exp_output_list[3*n_input:3*n_input+1*n_latent]))
     hk_stats_vmap = dict(zip(hidden_units, exp_output_list[3*n_input+1*n_latent:3*n_input+2*n_latent]))
     hk_gibbs_vmap = dict(zip(hidden_units, exp_output_list[3*n_input+2*n_latent:3*n_input+3*n_latent]))
-    
     # add the Theano updates for the persistent CD states:
     if persistent_vmap is not None:
         for u, v in persistent_vmap.items():
@@ -317,6 +323,7 @@ def pt_stats(rbm, v0_vmap, visible_units, hidden_units, persistent_vmap, beta, k
             
     stats['data_activation'] = activation_data_vmap
     stats['model_activation'] = activation_model_vmap
+    stats['accepted'] = accepted
         
     return stats
 
